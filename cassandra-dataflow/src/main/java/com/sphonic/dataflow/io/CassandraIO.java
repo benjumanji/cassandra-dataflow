@@ -13,23 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.sphonic.dataflow.io;
+package com.sphonic.paypoint.dataflow.io;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Supplier;
+import java.util.concurrent.ExecutionException;
 
-import com.datastax.driver.core.BoundStatement;
 import com.datastax.driver.core.Cluster;
-import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.Session;
-import com.datastax.driver.core.Statement;
-import com.datastax.driver.core.ResultSetFuture;
+import com.datastax.driver.core.exceptions.DriverException;
+import com.datastax.driver.core.exceptions.DriverInternalError;
+import com.datastax.driver.mapping.Mapper;
+import com.datastax.driver.mapping.MappingManager;
 import com.google.cloud.dataflow.sdk.Pipeline;
 import com.google.cloud.dataflow.sdk.coders.Coder;
 import com.google.cloud.dataflow.sdk.coders.SerializableCoder;
-import com.google.cloud.dataflow.sdk.options.PipelineOptions;
 import com.google.cloud.dataflow.sdk.transforms.Create;
 import com.google.cloud.dataflow.sdk.transforms.DoFn;
 import com.google.cloud.dataflow.sdk.transforms.ParDo;
@@ -38,6 +36,8 @@ import com.google.cloud.dataflow.sdk.transforms.View;
 import com.google.cloud.dataflow.sdk.values.PCollection;
 import com.google.cloud.dataflow.sdk.values.PCollectionView;
 import com.google.cloud.dataflow.sdk.values.PDone;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.Uninterruptibles;
 
 public class CassandraIO {
 
@@ -76,8 +76,8 @@ public class CassandraIO {
         _port = port;
       }
 
-      public <T extends CassandraBindable> Bound<T> bind(String query) {
-        return new Bound<T>(_hosts, _keyspace, _port, query);
+      public <T> Bound<T> bind() {
+        return new Bound<T>(_hosts, _keyspace, _port);
       }
 
       public Unbound hosts(String... hosts) {
@@ -93,21 +93,19 @@ public class CassandraIO {
       }
     }
 
-    public static class Bound<T extends CassandraBindable>
-        extends PTransform<PCollection<T>, PDone> implements Supplier<PTransform<PCollection<T>, PDone>> {
+    public static class Bound<T>
+        extends PTransform<PCollection<T>, PDone> {
 
       private static final long serialVersionUID = 0;
 
       private final String[] _hosts;
       private final String _keyspace;
       private final int _port;
-      private final String _query;
 
-      Bound(String[] hosts, String keyspace, int port, String query) {
+      Bound(String[] hosts, String keyspace, int port) {
         _hosts = hosts;
         _keyspace = keyspace;
         _port = port;
-        _query = query;
       }
 
       public String[] getHosts() {
@@ -120,14 +118,6 @@ public class CassandraIO {
 
       public int getPort() {
         return _port;
-      }
-
-      public String getInsert() {
-        return _query;
-      }
-
-      public PTransform<PCollection<T>, PDone> get() {
-        return new Bound<T>(_hosts, _keyspace, _port, _query);
       }
 
       @SuppressWarnings("unchecked")
@@ -194,17 +184,17 @@ public class CassandraIO {
       }
     }
 
-    private static class CassandraWriteOperation<T extends CassandraBindable> implements java.io.Serializable {
+    private static class CassandraWriteOperation<T> implements java.io.Serializable {
 
       private static final long serialVersionUID = 0;
 
       private final String[] _hosts;
       private final int _port;
       private final String _keyspace;
-      private final String _query;
 
       private transient Cluster _cluster;
       private transient Session _session;
+      private transient MappingManager _manager;
 
       private synchronized Cluster getCluster() {
         if (_cluster == null) {
@@ -228,15 +218,22 @@ public class CassandraIO {
         return _session;
       }
 
+      private synchronized MappingManager getManager() {
+        if (_manager == null) {
+          Session session = getSession();
+          _manager = new MappingManager(_session);
+        }
+        return _manager;
+      }
+
       public CassandraWriteOperation(Bound<T> bound) {
         _hosts = bound.getHosts();
         _port = bound.getPort();
         _keyspace = bound.getKeyspace();
-        _query = bound.getInsert();
       }
 
       public CassandraWriter<T> createWriter() {
-        return new CassandraWriter<T>(this, getSession(), _query);
+        return new CassandraWriter<T>(this, getManager());
       }
 
       public void finalize() {
@@ -245,23 +242,31 @@ public class CassandraIO {
       }
     }
 
-    private static class CassandraWriter<T extends CassandraBindable> {
+    private static class CassandraWriter<T> {
+      //TODO(benedwards): Pipeline option.
       private static int BATCH_SIZE = 20000;
 
       private final CassandraWriteOperation _op;
-      private final Session _session;
-      private final List<ResultSetFuture> _results = new ArrayList<ResultSetFuture>();
-      private final PreparedStatement _stmt;
+      private final MappingManager _manager;
+      private final List<ListenableFuture<Void>> _results = new ArrayList<ListenableFuture<Void>>();
+      private Mapper<T> _mapper;
 
-      public CassandraWriter(CassandraWriteOperation op, Session session, String query) {
+      public CassandraWriter(CassandraWriteOperation op, MappingManager manager) {
         _op = op;
-        _session = session;
-        _stmt = session.prepare(query);
+        _manager = manager;
       }
 
       public void flush() {
-        for (ResultSetFuture result: _results) {
-          result.getUninterruptibly();
+        for (ListenableFuture<Void> result: _results) {
+          // this is inlined from the driver.
+          try {
+            Uninterruptibles.getUninterruptibly(result);
+          } catch(ExecutionException e) {
+            if (e.getCause() instanceof DriverException)
+              throw ((DriverException)e.getCause()).copy();
+            else
+              throw new DriverInternalError("Unexpected exception thrown", e.getCause());
+          }
         }
         _results.clear();
       }
@@ -270,16 +275,18 @@ public class CassandraIO {
         return _op;
       }
 
-      public void write(T statement) {
-        Object[] bindable = statement.toBindable();
-        BoundStatement stmt = _stmt.bind(bindable);
+      @SuppressWarnings("unchecked")
+      public void write(T entity) {
+
+        //TODO(benedwards): Is there anyway to hoist this to the constructor?
+        if (_mapper == null)
+          _mapper = (Mapper<T>)_manager.mapper(entity.getClass());
+
         if (_results.size() >= BATCH_SIZE)
           flush();
 
-        _results.add(_session.executeAsync(stmt));
+        _results.add(_mapper.saveAsync(entity));
       }
     }
   }
 }
-
-

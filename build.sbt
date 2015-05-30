@@ -20,6 +20,7 @@ lazy val cassandraDataflow = project.in(file("cassandra-dataflow"))
   .settings(
     libraryDependencies ++= Seq(
       "com.datastax.cassandra" % "cassandra-driver-core" % "2.1.3",
+      "com.datastax.cassandra" % "cassandra-driver-mapping" % "2.1.3",
       "com.google.apis" % "google-api-services-storage" % "v1-rev25-1.19.1" exclude("com.google.guava", "guava-jdk5") ,
       "com.google.cloud.dataflow" % "google-cloud-dataflow-java-sdk-all" % "0.4.150414" exclude("org.slf4j", "slf4j-jdk14"),
       "com.google.http-client" % "google-http-client-jackson2" % "1.19.0",
